@@ -1,0 +1,167 @@
+Let me read the remaining files carefully before designing anything.
+
+Now I have a complete picture of your codebase. Let me design the CAN firmware update system before writing a single line of code.
+
+---
+
+## Design Analysis
+
+**What you already have that maps cleanly to CAN:**
+
+Your `firmware_update_user.c` receives raw `uint8_t* buffer` and dispatches on `buffer[0]`. The protocol — `MetaHeader` and `ChunkHeader` — is transport-agnostic. You want to keep that logic entirely unchanged and just plug CAN in as a new input path. That's the right instinct and it's achievable.
+
+**The fundamental constraint:**
+
+Each CAN-FD frame is 64 bytes. Your existing `MCAN_DATA_FRAME` struct already uses a 3-byte header (`message_length` uint16 + `frame_num` uint8), leaving 61 bytes as `DATA_FRAME_PAYLOAD_SIZE`. So the real question is: **how do you reconstruct a logical message from a sequence of 61-byte CAN payloads, and hand it to `Process_Firmware_Update_Messages` as if it arrived in one shot?**
+
+Your `MetaHeader` is 42 bytes — fits in a single CAN frame. Your `ChunkHeader` is 13 bytes + payload. If you keep `CHUNK_SIZE = 1450` (from UDP), a single firmware chunk would require `ceil((13 + 1450) / 61) = 24` CAN frames just for one chunk. That's a lot of reassembly complexity, and the 64-message FIFO could overflow mid-chunk at high throughput.
+
+**The better approach for CAN: shrink the firmware chunk size.**
+
+On CAN you should use a much smaller logical chunk size — something that fits entirely in a single CAN frame. Specifically, `13 bytes (ChunkHeader) + 48 bytes payload = 61 bytes`, which fits exactly in one `DATA_FRAME_PAYLOAD_SIZE`. This gives you **one CAN frame = one firmware chunk**. The reassembly problem disappears entirely — you read one CAN frame, you have a complete packet to hand to `Process_Firmware_Update_Messages`.
+
+This does mean a 575 KB image becomes ~12,300 CAN frames, but that's fine — CAN-FD at 5 Mbps handles that in under a second.
+
+**The MetaHeader problem:**
+
+`MetaHeader` is 42 bytes. That also fits in 61 bytes, so one CAN frame handles the META packet too. The VCC card simply needs to pack a `MetaHeader` into a CAN frame and send it before the data chunks.
+
+**What needs to change in `Transmit_AppImage_On_CAN`:**
+
+Currently it sends the `MetaHeader` in one call then stops — it never sends the actual image data chunks over CAN. You need to add the full chunked transmission loop, which mirrors what `udp_file_v4.cpp` does on the PC side, but over CAN.
+
+**CAN Message ID allocation:**
+
+Your existing IDs (`CAN_VCC_TO_INPUT_FIRMWARE_MSG`, etc.) already distinguish the destination card type. The receiving card filters on its own ID. That's already wired correctly.
+
+**Receiving side (`StoreDataInSpecificRxBuffer`):**
+
+This function currently has an empty `switch` statement. This is exactly where the received CAN frames need to be fed into `Process_Firmware_Update_Messages`. The function already receives the raw payload bytes and the `pkt_msg_id`, so you just need to forward the right bytes to the firmware update logic.
+
+Here is the overall picture before coding:
+
+```
+VCC Card (Ethernet receiver + CAN transmitter)
+  UDP arrives → Process_Firmware_Update_Messages() → gTransferDone=true
+  Check_And_Write_Firmware() → card_type != VCC → Transmit_AppImage_On_CAN()
+    │
+    │  CAN frame 0: MetaHeader (42 bytes in payload)
+    │  CAN frame 1: ChunkHeader(offset=0, size=48) + 48 bytes image data
+    │  CAN frame 2: ChunkHeader(offset=48, size=48) + 48 bytes image data
+    │  ...
+    ▼
+Input/Output/Analog Card (CAN receiver)
+  ProcessIncomingCANFIFO() → StoreDataInSpecificRxBuffer()
+    → detects firmware msg ID
+    → calls Process_Firmware_Update_Messages(raw_can_payload, len)
+  Check_And_Write_Firmware() → card_type == self → QSPI_Write_Full_Image()
+```
+
+Now let me write the code. The changes touch three files: `firmware_update_user.c` (fill out `Transmit_AppImage_On_CAN`), `firmware_update_user.h` (add CAN chunk size constant), and `multi_mcan_user.c` (fill out `StoreDataInSpecificRxBuffer` and fix `ProcessIncomingCANFIFO`).
+
+Good — those constants all live in `common_include.h` or a board-specific header you haven't uploaded. I have enough context. Let me now write all three modified files.
+
+Now the updated `firmware_update_user.c` with the complete `Transmit_AppImage_On_CAN` implementation:
+
+Now the CAN receive side — this is the most important change:
+
+Now I'll make the targeted changes to `multi_mcan_user.c` — specifically `StoreDataInSpecificRxBuffer` and `ProcessIncomingCANFIFO`:
+
+Now replace `StoreDataInSpecificRxBuffer` — this is the core of the receive path:
+
+Now fix `ProcessIncomingCANFIFO` — the existing code extracts `data_frame.payload` (which strips the 3-byte CAN header) before calling `StoreDataInSpecificRxBuffer`. That was correct for the old design, but now we need to pass the raw payload that starts with `PKT_TYPE_META` or `PKT_TYPE_DATA` — which is exactly what the firmware update logic packed into `data_frame.payload` on the transmit side:
+
+---
+
+Here is a precise explanation of every decision made, so you understand the full picture.
+
+## The Key Insight: One CAN Frame = One Firmware Packet
+
+The original design on UDP used 1450-byte chunks. On CAN that breaks down because you'd need to reassemble ~24 frames into one logical chunk before you could verify the per-chunk CRC and call `Process_Firmware_Update_Messages`. That reassembly buffer adds complexity, state, and failure modes.
+
+The right move is to shrink the chunk size so the entire firmware DATA packet — `ChunkHeader` (13 bytes) + payload — fits in one `DATA_FRAME_PAYLOAD_SIZE` (61 bytes). That leaves 61 - 13 = **48 bytes** of firmware payload per CAN frame. This is `CAN_FW_CHUNK_SIZE` in the header. The result: `Process_Firmware_Update_Messages` is called once per CAN frame with a complete, self-contained packet, just like UDP. No state machine. No reassembly. No new code in the receiver.
+
+## What Changed and Why
+
+**`firmware_update_user.h`** got one addition: the `CAN_FW_CHUNK_SIZE = 48U` constant with a comment explaining the arithmetic. Everything else is unchanged because `MetaHeader` and `ChunkHeader` are already transport-agnostic.
+
+**`firmware_update_user.c` — `Transmit_AppImage_On_CAN`** was a stub that only sent the MetaHeader and stopped. It now has two phases. Phase 1 sends the MetaHeader packed into a `DATA_FRAME_PAYLOAD_SIZE` buffer — 42 bytes of real data, zero-padded to 61, which is fine because the receiver only reads `sizeof(MetaHeader)` bytes for a META packet. Phase 2 loops through `gImageBuffer` in 48-byte chunks, builds a `ChunkHeader` with per-chunk CRC32, packs `ChunkHeader + chunk bytes` into a 61-byte buffer, and calls `TransmitCANMessage` for both CAN instances 0 and 1. The `msg_len` argument passed to `TransmitCANMessage` is `sizeof(ChunkHeader) + this_chunk`, not the full 61 bytes, so the last chunk — which may be shorter than 48 bytes — carries the correct length in `STRUCT_MESSAGE_HEADER_CAN.message_length`. This is how the receiver knows exactly how many bytes to pass to `Process_Firmware_Update_Messages`.
+
+**`multi_mcan_user.c` — `StoreDataInSpecificRxBuffer`** was empty. It now has a `switch` on `pkt_msg_id` that catches all three firmware destination IDs (`CAN_VCC_TO_INPUT/OUTPUT/ANALOG_FIRMWARE_MSG`) and calls `Process_Firmware_Update_Messages(buff, safe_len)` directly. The `safe_len` clamp guards against a corrupt `message_length` field claiming more than 61 bytes.
+
+**`ProcessIncomingCANFIFO`** was already correct structurally — it extracts `data_frame.payload` and calls `StoreDataInSpecificRxBuffer`. The key is that `data_frame.payload` is exactly the buffer that `Transmit_AppImage_On_CAN` filled with the firmware packet, so the bytes line up perfectly. The only change made there was cleaning up the `fifo_num` selection into a ternary (cosmetic) and improving the comments.
+
+## One Thing To Be Aware Of
+
+Your `Transmit_AppImage_On_CAN` sends on both CAN instance 0 and 1 (matching what the original stub was doing). Both MCUs on the target card will therefore call `Process_Firmware_Update_Messages` with identical data independently. That's fine — each MCU has its own `gImageBuffer` and its own flash. But it means the VCC card is sending ~24,600 CAN frames (12,300 × 2 instances) for a 575 KB image. At CAN-FD 5 Mbps with 64-byte frames, that's roughly 400 ms. If that's acceptable for your bootloader timing budget you're fine. If you need it faster, you could send on only one instance and have the two MCUs coordinate via their inter-CPU GPIO lines that you're already using in `gpio_user.c`.
+
+
+
+
+
+
+
+
+
+
+
+
+You've identified a real problem. Let me explain exactly why it matters before writing code.
+
+## Why calling `Process_Firmware_Update_Messages` from inside `ProcessIncomingCANFIFO` is dangerous
+
+`ProcessIncomingCANFIFO` drains the FIFO in a tight `while (fifoStatus.fillLvl > 0)` loop. Right now, for each frame it calls `Process_Firmware_Update_Messages`, which includes `crcFast()` on the chunk payload, a `memcpy` into the 1 MB `gImageBuffer`, and potentially a SHA-256 + whole-image CRC at the end of the transfer. Even the light per-chunk work adds up — at ~12,300 frames, you're spending time inside the processing loop while the VCC card is still transmitting. The FIFO is only 64 messages deep. If the VCC card is transmitting at CAN-FD 5 Mbps and your MCU is spending more time processing each frame than it takes for the next frame to arrive, the FIFO fills up and starts dropping messages silently (in overwrite mode) or blocks (in blocking mode). You'd get a corrupt image with no visible error.
+
+The fix you're describing is the standard producer-consumer pattern for exactly this scenario: the interrupt (or FIFO drain function) is the **producer** — it does nothing except copy raw bytes into a ring buffer as fast as possible, then gets out of the way. `mcan_checks()` in the main loop is the **consumer** — it reads from the ring buffer at leisure and calls `Process_Firmware_Update_Messages`. The FIFO draining stays fast, the processing happens when the CPU is free.
+
+## Designing the ring buffer
+
+The ring buffer needs to hold firmware packets, not raw CAN frames. Each slot should store the `pkt_msg_id` and the raw payload bytes (up to `DATA_FRAME_PAYLOAD_SIZE` = 61 bytes) along with the actual byte count — identical to what `StoreDataInSpecificRxBuffer` currently receives. A ring buffer of, say, 128 slots gives you a comfortable cushion: even if `mcan_checks` isn't called for a few main loop iterations, 128 slots of headroom means the FIFO never overflows.
+
+The struct for each slot:
+
+```c
+typedef struct {
+    uint16_t msg_id;
+    uint16_t len;
+    uint8_t  data[DATA_FRAME_PAYLOAD_SIZE];
+} CanFwRxSlot;
+```
+
+The ring buffer itself is a statically allocated array of these slots with a write index (advanced by `StoreDataInSpecificRxBuffer`) and a read index (advanced by `mcan_checks`). Because you're bare-metal with no RTOS here, and `ProcessIncomingCANFIFO` is called from the main loop rather than from an ISR, there's actually no true concurrency — but the discipline of keeping drain and process separate is still correct and future-proofs the design if you later move the FIFO drain into an ISR.
+
+Let me now write the updated `multi_mcan_user.c` with these changes, plus a new `can_fw_rx_buffer.h` header to keep the ring buffer type visible to both `multi_mcan_user.c` and anywhere else that might need it.
+
+Now add the ring buffer definitions right after the existing module-level variable declarations:
+
+Now replace `StoreDataInSpecificRxBuffer` with the pure store-only version:
+
+Now replace `mcan_checks` with the consumer:
+
+Now fix `ProcessIncomingCANFIFO` to match the cleaner version and copy everything out:
+
+---
+
+Here is a precise walkthrough of every decision made.
+
+**The three roles and why they're separated the way they are**
+
+The ISR (`MCAN0_IntrISR` etc.) does the absolute minimum — it reads and clears the interrupt status register. It doesn't even touch the FIFO. This is correct and unchanged.
+
+`ProcessIncomingCANFIFO` is called from the main loop and drains the hardware FIFO completely on every call. Its only job is to read each frame out of MCAN message RAM, extract the payload, call `StoreDataInSpecificRxBuffer`, and immediately acknowledge the FIFO slot so the hardware can reuse it. The acknowledgement (`MCAN_writeRxFIFOAck`) happens inside the loop right after the copy — this is important because it frees the hardware slot as quickly as possible, minimising the window during which a fast transmitter could overflow the hardware FIFO.
+
+`mcan_checks` is also called from the main loop and processes **one** ring buffer slot per call. The deliberate choice to process one slot rather than drain the entire ring keeps the main loop responsive — `ethernet_checks` and `Check_And_Write_Firmware` still get called on every iteration. The ring buffer (128 slots) provides the temporal decoupling between the two: even if `mcan_checks` is occasionally delayed, there's enough headroom that `StoreDataInSpecificRxBuffer` won't overrun.
+
+**Why the ring buffer write index is advanced last**
+
+Inside `StoreDataInSpecificRxBuffer`, the slot is fully populated (`msg_id`, `len`, `data[]`) before `gFwRxWriteIdx` is incremented. This ordering matters because `mcan_checks` uses `FW_RX_RING_EMPTY()` which compares `gFwRxWriteIdx == gFwRxReadIdx`. If the write index were advanced before the data was copied, there's a theoretical window where `mcan_checks` could see the new index, read the slot, and find stale or partial data. Since you're bare-metal with no RTOS and `ProcessIncomingCANFIFO` and `mcan_checks` are both called from the same main loop thread (not from an ISR), this is not actually a race condition today — but the ordering discipline is correct and would remain correct if you ever moved FIFO draining into an ISR.
+
+**The `gFwRxDropped` counter**
+
+This is purely a diagnostic aid. In normal operation it should remain zero — 128 ring slots is more than double the hardware FIFO depth of 64, so overrun requires `mcan_checks` to be starved for the time it takes to fill both the hardware FIFO and the entire ring, which would mean the main loop is blocked for an unreasonably long time. If you ever see `gFwRxDropped` incrementing in testing, it's a signal that something else in the main loop is blocking for too long, not that the ring buffer is undersized.
+
+**One thing to verify on your end**
+
+The `msg_len` stored in `STRUCT_MESSAGE_HEADER_CAN.message_length` by `Transmit_AppImage_On_CAN` is `sizeof(ChunkHeader) + this_chunk` — which is 61 bytes for full chunks and less for the final chunk. Make sure `TransmitCANMessage` faithfully stores this `pkt_len` argument into `data_frame.msg_header.message_length` before transmission. Looking at your existing code, `data_frame.msg_header.message_length = msg_len` is set from the `msg_len` argument to `TransmitCANMessage` — so this is already correct. The receiver reads it back out and passes it as `safe_len` to `Process_Firmware_Update_Messages`, which is exactly the byte count the firmware update handler needs.
+
+Please start a new conversation for the next topic — this one is getting long enough to cost significantly more tokens per message.
