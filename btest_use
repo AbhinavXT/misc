@@ -1,0 +1,10 @@
+const BrakeSpec *s = brake_spec_get(LOCO_WAG9, MODE_FORMATION, CMD_FS);
+
+bool mr_ok          = range_contains_tol(s->mr,         read_mr(), MR_TOL);
+bool bp_charged_ok  = range_contains_tol(s->bp_charged, read_bp(), BP_TOL);
+/* send BIU command, wait, then: */
+bool bp_ok          = range_contains_tol(s->bp,         read_bp(), BP_TOL);
+bool bc_ok          = range_contains_tol(s->bc,         read_bc(), BC_TOL);
+bool t_apply_ok     = range_contains   (s->t_apply,     elapsed_s);
+/* release, wait, then: */
+bool t_release_ok   = range_contains   (s->t_release,   release_elapsed_s);
