@@ -1,0 +1,78 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+typedef enum { LOCO_WAP7 = 0, LOCO_WAG9, LOCO_WAP5, LOCO_COUNT } LocoType;
+typedef enum { MODE_LEM  = 0, MODE_FORMATION,       MODE_COUNT } Mode;
+typedef enum { CMD_NB    = 0, CMD_FS, CMD_EB,       CMD_COUNT  } Command;
+
+typedef struct { float min; float max; } Range;
+
+#define RANGE_TOL(nom, t)   { (float)((nom) - (t)), (float)((nom) + (t)) }
+#define RANGE_UPPER(m)      { 0.0f, (float)(m) }
+#define RANGE_BETWEEN(a, b) { (float)(a), (float)(b) }
+
+/* Everything needed to validate any checkpoint for a (loco, mode, command). */
+typedef struct {
+    Range mr;          /* Main Reservoir baseline                */
+    Range bp_charged;  /* BP at rest, brake released             */
+    Range bp;          /* BP target after this command           */
+    Range bc;          /* BC target after this command           */
+    Range t_apply;     /* Application timing                     */
+    Range t_release;   /* Release timing                         */
+} BrakeSpec;
+
+/* MR and bp_charged repeat across mode/command — that's the tradeoff. */
+#define MR_STD          RANGE_BETWEEN(8.0f, 10.0f)
+#define BP_CHARGED_STD  RANGE_TOL(5.0f, 0.1f)
+
+static const BrakeSpec kBrakeTable[LOCO_COUNT][MODE_COUNT][CMD_COUNT] = {
+    /* WAP7 */ {
+        /* LEM */ {
+            [CMD_NB] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(4.4f,0.1f), RANGE_TOL(1.0f,0.1f), RANGE_UPPER(8), RANGE_UPPER(15) },
+            [CMD_FS] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(3.5f,0.2f), RANGE_TOL(3.5f,0.1f), RANGE_UPPER(8), RANGE_UPPER(20) },
+            [CMD_EB] = { MR_STD, BP_CHARGED_STD, RANGE_UPPER(0.3f),    RANGE_TOL(3.5f,0.1f), RANGE_UPPER(8), RANGE_UPPER(25) },
+        },
+        /* FORMATION */ {
+            [CMD_NB] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(4.4f,0.1f), RANGE_TOL(1.0f,0.1f), RANGE_UPPER(9), RANGE_UPPER(15) },
+            [CMD_FS] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(3.5f,0.2f), RANGE_TOL(2.5f,0.1f), RANGE_UPPER(9), RANGE_UPPER(20) },
+            [CMD_EB] = { MR_STD, BP_CHARGED_STD, RANGE_UPPER(0.3f),    RANGE_TOL(2.5f,0.1f), RANGE_UPPER(9), RANGE_UPPER(20) },
+        },
+    },
+    /* WAG9 */ {
+        /* LEM */ {
+            [CMD_NB] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(4.4f,0.1f), RANGE_TOL(1.0f,0.1f), RANGE_UPPER(8), RANGE_UPPER(45)        },
+            [CMD_FS] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(3.5f,0.2f), RANGE_TOL(3.5f,0.1f), RANGE_UPPER(8), RANGE_UPPER(60)        },
+            [CMD_EB] = { MR_STD, BP_CHARGED_STD, RANGE_UPPER(0.3f),    RANGE_TOL(3.5f,0.1f), RANGE_UPPER(8), RANGE_BETWEEN(45,60)   },
+        },
+        /* FORMATION */ {
+            [CMD_NB] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(4.4f,0.1f), RANGE_TOL(1.0f,0.1f), RANGE_UPPER(18),       RANGE_UPPER(45)       },
+            [CMD_FS] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(3.5f,0.2f), RANGE_TOL(2.5f,0.1f), RANGE_BETWEEN(18,24),  RANGE_BETWEEN(45,60)  },
+            [CMD_EB] = { MR_STD, BP_CHARGED_STD, RANGE_UPPER(0.3f),    RANGE_TOL(2.5f,0.1f), RANGE_BETWEEN(18,24),  RANGE_BETWEEN(45,60)  },
+        },
+    },
+    /* WAP5 */ {
+        /* LEM */ {
+            [CMD_NB] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(4.4f,0.1f), RANGE_TOL(2.16f,0.15f), RANGE_UPPER(8), RANGE_UPPER(15) },
+            [CMD_FS] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(3.5f,0.2f), RANGE_TOL(5.15f,0.3f),  RANGE_UPPER(8), RANGE_UPPER(20) },
+            [CMD_EB] = { MR_STD, BP_CHARGED_STD, RANGE_UPPER(0.3f),    RANGE_TOL(5.15f,0.3f),  RANGE_UPPER(8), RANGE_UPPER(20) },
+        },
+        /* FORMATION */ {
+            [CMD_NB] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(4.4f,0.1f), RANGE_TOL(2.16f,0.15f), RANGE_UPPER(9), RANGE_UPPER(15) },
+            [CMD_FS] = { MR_STD, BP_CHARGED_STD, RANGE_TOL(3.5f,0.2f), RANGE_TOL(5.15f,0.3f),  RANGE_UPPER(9), RANGE_UPPER(20) },
+            [CMD_EB] = { MR_STD, BP_CHARGED_STD, RANGE_UPPER(0.3f),    RANGE_TOL(5.15f,0.3f),  RANGE_UPPER(5), RANGE_UPPER(20) },
+        },
+    },
+};
+
+/* --- Helpers --- */
+static inline float range_nominal(Range r)           { return (r.min + r.max) * 0.5f; }
+static inline bool  range_contains(Range r, float v) { return v >= r.min && v <= r.max; }
+static inline bool  range_contains_tol(Range r, float v, float tol) {
+    return v >= (r.min - tol) && v <= (r.max + tol);
+}
+
+static inline const BrakeSpec *brake_spec_get(LocoType loco, Mode mode, Command cmd) {
+    if (loco >= LOCO_COUNT || mode >= MODE_COUNT || cmd >= CMD_COUNT) return NULL;
+    return &kBrakeTable[loco][mode][cmd];
+}
